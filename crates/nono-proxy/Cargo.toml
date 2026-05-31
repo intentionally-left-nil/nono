@@ -33,6 +33,10 @@ getrandom.workspace = true
 base64 = "0.22"
 subtle = "2"
 url.workspace = true
+# AWS SigV4 signing support (smithy-rs, no service SDK required)
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 urlencoding = "2"
 globset.workspace = true
 

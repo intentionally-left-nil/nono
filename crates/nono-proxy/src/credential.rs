@@ -9,6 +9,7 @@
 //! is handled by [`crate::route::RouteStore`], which loads independently of
 //! credentials. This module handles only credential-specific concerns.
 
+use crate::aws::route::AwsRoute;
 use crate::config::{InjectMode, RouteConfig};
 use crate::error::{ProxyError, Result};
 use crate::oauth2::{OAuth2ExchangeConfig, TokenCache};
@@ -90,6 +91,8 @@ pub struct CredentialStore {
     credentials: HashMap<String, LoadedCredential>,
     /// Map from route prefix to OAuth2 route (token cache + upstream)
     oauth2_routes: HashMap<String, OAuth2Route>,
+    /// Map from route prefix to AWS SigV4 route
+    aws_routes: HashMap<String, AwsRoute>,
 }
 
 impl CredentialStore {
@@ -113,6 +116,13 @@ impl CredentialStore {
     pub fn load(routes: &[RouteConfig], tls_connector: &TlsConnector) -> Result<Self> {
         let mut credentials = HashMap::new();
         let mut oauth2_routes = HashMap::new();
+        let mut aws_routes = HashMap::new();
+        // Shared provider cache: keyed by profile_key (profile name or "<default>").
+        // Routes with the same profile share one provider instance.
+        let mut provider_cache: HashMap<
+            String,
+            aws_credential_types::provider::SharedCredentialsProvider,
+        > = HashMap::new();
 
         for route in routes {
             // Normalize prefix: strip leading/trailing slashes so it matches
@@ -264,11 +274,123 @@ impl CredentialStore {
                     }
                 }
             }
+
+            // AWS SigV4 path
+            if let Some(ref aws_auth) = route.aws_auth {
+                // Mutual-exclusion check: aws_auth is incompatible with
+                // credential_key and oauth2.
+                if route.credential_key.is_some() || route.oauth2.is_some() {
+                    return Err(ProxyError::Config(format!(
+                        "route '{}': aws_auth is mutually exclusive with credential_key and oauth2; \
+                         remove the other auth method",
+                        normalized_prefix
+                    )));
+                }
+
+                debug!(
+                    "aws credential load: prefix='{}' upstream='{}' explicit_region={:?} \
+                     explicit_service={:?} profile={:?}",
+                    normalized_prefix,
+                    route.upstream,
+                    aws_auth.region,
+                    aws_auth.service,
+                    aws_auth.profile,
+                );
+
+                // Resolve region and service.
+                let upstream_host = extract_host(&route.upstream);
+                debug!(
+                    "aws credential load: resolved upstream host='{}' from upstream='{}'",
+                    upstream_host, route.upstream
+                );
+                let region = match crate::aws::resolve::resolve_region(
+                    aws_auth.region.as_deref(),
+                    &upstream_host,
+                ) {
+                    Ok(r) => r,
+                    Err(msg) => {
+                        warn!(
+                            "AWS route '{}': {} — route will be unavailable.",
+                            normalized_prefix, msg
+                        );
+                        continue;
+                    }
+                };
+                debug!(
+                    "aws credential load: prefix='{}' resolved region='{}'",
+                    normalized_prefix, region
+                );
+                let service = match crate::aws::resolve::resolve_service(
+                    aws_auth.service.as_deref(),
+                    &upstream_host,
+                ) {
+                    Ok(s) => s,
+                    Err(msg) => {
+                        warn!(
+                            "AWS route '{}': {} — route will be unavailable.",
+                            normalized_prefix, msg
+                        );
+                        continue;
+                    }
+                };
+                debug!(
+                    "aws credential load: prefix='{}' resolved service='{}'",
+                    normalized_prefix, service
+                );
+
+                // Build or reuse the credential provider.
+                let profile_key = aws_auth
+                    .profile
+                    .as_deref()
+                    .unwrap_or(crate::aws::provider::DEFAULT_PROFILE_KEY)
+                    .to_string();
+                let profile_opt = aws_auth.profile.as_deref();
+                debug!(
+                    "aws credential load: prefix='{}' building provider for profile_key='{}'",
+                    normalized_prefix, profile_key
+                );
+
+                let provider = match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::aws::provider::get_or_build_provider(
+                            profile_opt,
+                            &mut provider_cache,
+                        ),
+                    )
+                }) {
+                    Ok(p) => p,
+                    Err(msg) => {
+                        warn!(
+                            "AWS route '{}': could not build credential provider: {} — \
+                             managed-credential requests on this route will be denied.",
+                            normalized_prefix, msg
+                        );
+                        continue;
+                    }
+                };
+
+                debug!(
+                    "aws credential load: prefix='{}' provider ready; inserting route \
+                     (region='{}', service='{}', profile_key='{}')",
+                    normalized_prefix, region, service, profile_key
+                );
+                aws_routes.insert(
+                    normalized_prefix.clone(),
+                    crate::aws::route::AwsRoute {
+                        upstream: route.upstream.clone(),
+                        region,
+                        service,
+                        profile_key,
+                        provider,
+                    },
+                );
+            }
         }
 
         Ok(Self {
             credentials,
             oauth2_routes,
+            aws_routes,
         })
     }
 
@@ -278,6 +400,7 @@ impl CredentialStore {
         Self {
             credentials: HashMap::new(),
             oauth2_routes: HashMap::new(),
+            aws_routes: HashMap::new(),
         }
     }
 
@@ -293,25 +416,32 @@ impl CredentialStore {
         self.oauth2_routes.get(prefix)
     }
 
-    /// Check if any credentials (static or OAuth2) are loaded.
+    /// Get an AWS SigV4 route for a route prefix, if configured.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.credentials.is_empty() && self.oauth2_routes.is_empty()
+    pub fn get_aws(&self, prefix: &str) -> Option<&crate::aws::route::AwsRoute> {
+        self.aws_routes.get(prefix)
     }
 
-    /// Number of loaded credentials (static + OAuth2).
+    /// Check if any credentials (static or OAuth2 or AWS) are loaded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.credentials.is_empty() && self.oauth2_routes.is_empty() && self.aws_routes.is_empty()
+    }
+
+    /// Number of loaded credentials (static + OAuth2 + AWS).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.credentials.len() + self.oauth2_routes.len()
+        self.credentials.len() + self.oauth2_routes.len() + self.aws_routes.len()
     }
 
     /// Returns the set of route prefixes that have loaded credentials
-    /// (both static keystore and OAuth2 routes).
+    /// (static keystore, OAuth2, and AWS routes).
     #[must_use]
     pub fn loaded_prefixes(&self) -> std::collections::HashSet<String> {
         self.credentials
             .keys()
             .chain(self.oauth2_routes.keys())
+            .chain(self.aws_routes.keys())
             .cloned()
             .collect()
     }
@@ -320,6 +450,16 @@ impl CredentialStore {
 /// The keyring service name used by nono for all credentials.
 /// Uses the same constant as `nono::keystore::DEFAULT_SERVICE` to ensure consistency.
 const KEYRING_SERVICE: &str = nono::keystore::DEFAULT_SERVICE;
+
+/// Extract the hostname from a URL string (e.g., `"https://foo.amazonaws.com"` → `"foo.amazonaws.com"`).
+/// Returns the full URL on parse failure — callers should handle the resulting
+/// region/service resolution error gracefully.
+fn extract_host(upstream: &str) -> String {
+    url::Url::parse(upstream)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| upstream.to_string())
+}
 
 /// Build a hint for the credential-not-found warning that probes other
 /// credential sources for the same name.
@@ -547,6 +687,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = CredentialStore::load(&routes, &tls);
         assert!(store.is_ok());
@@ -581,6 +722,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            aws_routes: HashMap::new(),
         };
 
         assert!(
@@ -609,6 +751,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            aws_routes: HashMap::new(),
         };
 
         let prefixes = store.loaded_prefixes();
@@ -637,6 +780,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = CredentialStore::load(&routes, &tls).expect("credential load");
         let cred = store.get("litellm").expect("route should be loaded");
@@ -666,6 +810,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = CredentialStore::load(&routes, &tls).expect("credential load");
         let cred = store.get("api").expect("route should be loaded");
@@ -706,6 +851,7 @@ mod tests {
                 client_secret: "env://TEST_OAUTH2_CLIENT_SECRET".to_string(),
                 scope: String::new(),
             }),
+            aws_auth: None,
         }];
 
         let store = CredentialStore::load(&routes, &tls);

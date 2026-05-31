@@ -484,7 +484,7 @@
     },
     "CustomCredentialDef": {
       "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have either credential_key or auth (mutually exclusive).",
+      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have either credential_key, auth, or aws_auth (mutually exclusive).",
       "additionalProperties": false,
       "required": ["upstream"],
       "properties": {
@@ -580,6 +580,41 @@
             { "type": "null" }
           ],
           "description": "Path to the PEM-encoded private key corresponding to tls_client_cert. Must be set together with tls_client_cert."
+        },
+        "aws_auth": {
+          "oneOf": [
+            { "$ref": "#/$defs/AwsAuthConfig" },
+            { "type": "null" }
+          ],
+          "description": "AWS SigV4 signing configuration. When present, the proxy re-signs outbound requests with real AWS credentials. The agent's incoming Authorization and x-amz-* headers are stripped and replaced with a fresh SigV4 signature. Mutually exclusive with credential_key and auth."
+        }
+      }
+    },
+    "AwsAuthConfig": {
+      "type": "object",
+      "description": "AWS SigV4 signing configuration for a custom credential route. All fields are optional — empty aws_auth: {} uses the default credential chain with region and service auto-detected from the upstream URL.",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "AWS profile name from ~/.aws/config or ~/.aws/credentials. If set, only this profile is used and AWS_PROFILE is ignored. If omitted, the default credential chain is used (env vars → AWS_PROFILE → default profile → web identity → ECS → IMDS → SSO)."
+        },
+        "region": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "SigV4 signing region (e.g., \"us-east-1\"). If omitted, parsed from the upstream host. Set explicitly for endpoints that don't follow the standard <service>.<region>.amazonaws.com pattern."
+        },
+        "service": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "SigV4 service name (e.g., \"bedrock\", \"s3\"). If omitted, looked up from a built-in host-to-service table. Set explicitly for services not in the table."
         }
       }
     },

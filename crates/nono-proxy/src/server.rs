@@ -117,6 +117,17 @@ impl ProxyHandle {
                 } else {
                     "creds: oauth2 ✗ (token exchange failed)".to_string()
                 }
+            } else if let Some(ref aws) = route.aws_auth {
+                let resolved = self.loaded_routes.contains(&prefix);
+                let profile_label = aws
+                    .profile
+                    .as_deref()
+                    .unwrap_or("<default>");
+                if resolved {
+                    format!("creds: aws/{} ✓", profile_label)
+                } else {
+                    format!("creds: aws/{} ✗ (provider build failed)", profile_label)
+                }
             } else {
                 "creds: none".to_string()
             };
@@ -124,6 +135,7 @@ impl ProxyHandle {
             let intercept_summary = if self.intercept_ca_path.is_some()
                 && (route.credential_key.is_some()
                     || route.oauth2.is_some()
+                    || route.aws_auth.is_some()
                     || !route.endpoint_rules.is_empty())
             {
                 "intercept: on"
@@ -219,7 +231,12 @@ impl ProxyHandle {
             vars.push(("REQUESTS_CA_BUNDLE".to_string(), path_str.clone()));
             vars.push(("NODE_EXTRA_CA_CERTS".to_string(), path_str.clone()));
             vars.push(("CURL_CA_BUNDLE".to_string(), path_str.clone()));
-            vars.push(("GIT_SSL_CAINFO".to_string(), path_str));
+            vars.push(("GIT_SSL_CAINFO".to_string(), path_str.clone()));
+            // botocore (Python AWS SDK) ignores the generic SSL_CERT_FILE and
+            // REQUESTS_CA_BUNDLE vars; it reads AWS_CA_BUNDLE exclusively.
+            // Set it to the same merged trust bundle so boto3 clients inside
+            // the sandbox trust the ephemeral MITM CA.
+            vars.push(("AWS_CA_BUNDLE".to_string(), path_str));
         }
 
         vars
@@ -917,6 +934,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
                 ..Default::default()
@@ -948,6 +966,7 @@ mod tests {
             assert!(vars.iter().any(|(k, _)| k == "REQUESTS_CA_BUNDLE"));
             assert!(vars.iter().any(|(k, _)| k == "NODE_EXTRA_CA_CERTS"));
             assert!(vars.iter().any(|(k, _)| k == "CURL_CA_BUNDLE"));
+            assert!(vars.iter().any(|(k, _)| k == "AWS_CA_BUNDLE"));
 
             handle.shutdown();
         }
@@ -981,6 +1000,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -1027,6 +1047,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             intercept_ca_dir: Some(missing_dir),
             ..Default::default()
@@ -1073,6 +1094,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "alias".to_string(),
@@ -1091,6 +1113,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -1164,6 +1187,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1210,6 +1234,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1265,6 +1290,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1326,6 +1352,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -1344,6 +1371,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    aws_auth: None,
                 },
             ],
             ..Default::default()
@@ -1407,6 +1435,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1441,6 +1470,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1493,6 +1523,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };
@@ -1534,6 +1565,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             }],
             ..Default::default()
         };

@@ -338,6 +338,18 @@ pub struct CustomCredentialDef {
     /// to the certificate in `tls_client_cert`.
     #[serde(default)]
     pub tls_client_key: Option<String>,
+
+    /// Optional AWS SigV4 signing configuration.
+    ///
+    /// When present, the proxy re-signs outbound requests with real AWS
+    /// credentials from the configured profile (or the default credential chain).
+    /// The agent's incoming `Authorization` and `x-amz-*` headers are stripped
+    /// and replaced with a freshly computed SigV4 signature.
+    ///
+    /// Mutually exclusive with `credential_key` and `auth`.
+    /// The upstream must be an `https://` AWS endpoint.
+    #[serde(default)]
+    pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
 }
 
 fn default_inject_header() -> String {
@@ -444,6 +456,15 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
 fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    // Mutual exclusion: aws_auth is incompatible with credential_key and auth (OAuth2).
+    if cred.aws_auth.is_some() && (cred.credential_key.is_some() || cred.auth.is_some()) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' has 'aws_auth' set together with 'credential_key' or 'auth'; \
+             aws_auth is mutually exclusive with both — remove the other auth field",
+            name
+        )));
+    }
+
     // Mutual exclusion: credential_key and auth cannot both be set
     if cred.credential_key.is_some() && cred.auth.is_some() {
         return Err(NonoError::ProfileParse(format!(
@@ -453,12 +474,54 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
-    // At least one of credential_key or auth must be set
-    if cred.credential_key.is_none() && cred.auth.is_none() {
+    // At least one of credential_key, auth, or aws_auth must be set
+    if cred.credential_key.is_none() && cred.auth.is_none() && cred.aws_auth.is_none() {
         return Err(NonoError::ProfileParse(format!(
-            "custom credential '{}' must have either 'credential_key' or 'auth' set",
+            "custom credential '{}' must have either 'credential_key', 'auth', or 'aws_auth' set",
             name
         )));
+    }
+
+    // Validate aws_auth if present
+    if let Some(ref aws) = cred.aws_auth {
+        // profile: must be non-empty if set
+        if let Some(ref profile) = aws.profile
+            && profile.is_empty()
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "aws_auth.profile for custom credential '{}' must not be empty; \
+                 omit the field to use the default credential chain",
+                name
+            )));
+        }
+        // region: non-empty, no whitespace
+        if let Some(ref region) = aws.region
+            && (region.is_empty() || region.contains(char::is_whitespace))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "aws_auth.region for custom credential '{}' must be a non-empty string \
+                 with no whitespace (e.g., \"us-east-1\")",
+                name
+            )));
+        }
+        // service: non-empty, no whitespace
+        if let Some(ref service) = aws.service
+            && (service.is_empty() || service.contains(char::is_whitespace))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "aws_auth.service for custom credential '{}' must be a non-empty string \
+                 with no whitespace (e.g., \"bedrock\", \"s3\")",
+                name
+            )));
+        }
+        // AWS routes must use HTTPS (SigV4 over HTTP is insecure)
+        if !cred.upstream.starts_with("https://") {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' with aws_auth requires an https:// upstream URL; \
+                 got: '{}'",
+                name, cred.upstream
+            )));
+        }
     }
 
     // Validate OAuth2 auth if present
@@ -3837,6 +3900,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         }
     }
 
@@ -4001,6 +4065,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -4023,6 +4088,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -4047,6 +4113,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -4071,6 +4138,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -4093,6 +4161,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -4117,6 +4186,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -4139,6 +4209,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -4163,6 +4234,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -4187,6 +4259,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
@@ -4388,6 +4461,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         }
     }
 
@@ -4946,6 +5020,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -4968,6 +5043,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -5108,6 +5184,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -5130,6 +5207,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -6572,6 +6650,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -6597,6 +6676,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -6625,6 +6705,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -6653,6 +6734,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(
@@ -6713,6 +6795,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("example", &cred).is_ok());
     }
@@ -6735,6 +6818,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");

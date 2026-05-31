@@ -267,6 +267,17 @@ pub struct RouteConfig {
     /// Mutually exclusive with `credential_key` — use one or the other.
     #[serde(default)]
     pub oauth2: Option<OAuth2Config>,
+
+    /// Optional AWS SigV4 signing configuration.
+    ///
+    /// When present, the proxy re-signs outbound requests with real AWS
+    /// credentials resolved from the configured profile (or default chain).
+    /// The agent's incoming `Authorization` and `x-amz-*` headers are stripped
+    /// and replaced with a freshly computed SigV4 signature.
+    ///
+    /// Mutually exclusive with `credential_key` and `oauth2`.
+    #[serde(default)]
+    pub aws_auth: Option<AwsAuthConfig>,
 }
 
 /// Optional proxy-side overrides for credential injection shape.
@@ -492,6 +503,41 @@ pub struct OAuth2Config {
     /// OAuth2 scopes (space-separated). Empty = no scope parameter sent.
     #[serde(default)]
     pub scope: String,
+}
+
+/// AWS SigV4 signing configuration for a credential route.
+///
+/// When present on a route, the proxy:
+/// 1. Strips the agent's `Authorization` and all `x-amz-*` headers.
+/// 2. Resolves AWS credentials from `profile` (or the default chain).
+/// 3. Signs the request with SigV4 using `region` and `service`.
+/// 4. Forwards the re-signed request to the upstream.
+///
+/// All fields are optional. Empty `aws_auth: {}` is valid:
+/// default credential chain, region and service auto-detected from the
+/// upstream host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AwsAuthConfig {
+    /// AWS profile name. If set, only this profile is used; the `AWS_PROFILE`
+    /// environment variable and the default profile are both ignored.
+    /// If omitted, the SDK's default credential chain is used
+    /// (env → AWS_PROFILE → default profile → web identity → ECS → IMDS → SSO).
+    #[serde(default)]
+    pub profile: Option<String>,
+
+    /// Explicit SigV4 signing region (e.g., `"us-east-1"`).
+    /// If omitted, parsed from the upstream host: the second dotted segment
+    /// of `<service>.<region>.amazonaws.com`.
+    /// Required if auto-detection fails (e.g., custom endpoints).
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Explicit SigV4 service name (e.g., `"bedrock"`, `"s3"`).
+    /// If omitted, looked up in the built-in host-to-service table.
+    /// Required if the service is not in the table.
+    #[serde(default)]
+    pub service: Option<String>,
 }
 
 #[cfg(test)]

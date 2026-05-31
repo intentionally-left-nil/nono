@@ -276,9 +276,29 @@ where
 
     let cred = service.and_then(|s| ctx.credential_store.get(s));
     let oauth2_route = service.and_then(|s| ctx.credential_store.get_oauth2(s));
+    // Look up the AWS SigV4 route via the route's aws_route_key (which may
+    // differ from the service prefix when prefix normalisation is involved).
+    let aws_route_key = route.and_then(|r| r.aws_route_key.as_deref());
+    let aws_route = aws_route_key.and_then(|k| ctx.credential_store.get_aws(k));
+
+    debug!(
+        "tls_intercept: credential resolution for {} {}: \
+         service={:?} aws_route_key={:?} \
+         has_static_cred={} has_oauth2={} has_aws={}",
+        method,
+        path,
+        service,
+        aws_route_key,
+        cred.is_some(),
+        oauth2_route.is_some(),
+        aws_route.is_some(),
+    );
 
     if let Some(rt) = route
-        && rt.missing_managed_credential(cred.is_some(), oauth2_route.is_some())
+        && rt.missing_managed_credential(
+            cred.is_some(),
+            oauth2_route.is_some() || aws_route.is_some(),
+        )
     {
         let svc = service.unwrap_or("unknown");
         let reason = format!(
@@ -338,7 +358,9 @@ where
             audit::ProxyMode::ConnectIntercept,
             &audit::EventContext {
                 route_id: service,
-                managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
+                managed_credential_active: Some(
+                    cred.is_some() || oauth2_route.is_some() || aws_route.is_some(),
+                ),
                 injection_mode: cred.map(|c| match c.inject_mode {
                     InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
                     InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
@@ -358,8 +380,20 @@ where
 
     // --- Read body (Content-Length only; chunked is rare in API requests
     // and matches the existing reverse-proxy contract). ---
-    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = reverse::filter_headers(&header_bytes, strip_header);
+    // For AWS routes: strip incoming Authorization and x-amz-* headers so
+    // they don't get signed or forwarded. The signing step adds fresh ones.
+    let strip_header = if aws_route.is_some() {
+        // AWS routes: we strip Authorization and x-amz-* ourselves below.
+        ""
+    } else {
+        cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("")
+    };
+    let mut filtered_headers = reverse::filter_headers(&header_bytes, strip_header);
+    // For AWS routes, additionally strip Authorization and x-amz-* from the
+    // agent-supplied headers before signing.
+    if aws_route.is_some() {
+        filtered_headers.retain(|(name, _)| !crate::aws::sign::is_aws_header(name));
+    }
     let content_length = reverse::extract_content_length(&header_bytes);
     let body = match reverse::read_request_body(tls_stream, content_length, &buffered).await? {
         Some(b) => b,
@@ -372,12 +406,73 @@ where
         "{} {} {}\r\nHost: {}\r\n",
         method, transformed_path, version, upstream_authority
     ));
-    if let Some(cred) = cred {
+
+    // For AWS routes: compute a fresh SigV4 signature and inject the
+    // signing headers (Authorization, X-Amz-Date, X-Amz-Content-Sha256,
+    // and optionally X-Amz-Security-Token). The agent's incoming AWS
+    // headers were already stripped from filtered_headers above.
+    if let Some(aws) = aws_route {
+        let full_url = format!("https://{}{}", upstream_authority, transformed_path);
+        debug!(
+            "tls_intercept: signing AWS request: method={} url='{}' \
+             route_service='{}' route_region='{}' body_len={} \
+             header_count={}",
+            method,
+            full_url,
+            aws.service,
+            aws.region,
+            body.len(),
+            filtered_headers.len(),
+        );
+        match crate::aws::sign::sign_request(aws, &method, &full_url, &filtered_headers, &body)
+            .await
+        {
+            Ok(sign_headers) => {
+                debug!(
+                    "tls_intercept: SigV4 signing succeeded; injecting {} headers: {:?}",
+                    sign_headers.len(),
+                    sign_headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+                );
+                for (name, value) in &sign_headers {
+                    request.push_str(&format!("{}: {}\r\n", name, value));
+                }
+            }
+            Err(e) => {
+                let svc = service.unwrap_or("unknown");
+                let reason = format!(
+                    "AWS credential resolution failed for route '{}': {}",
+                    svc, e
+                );
+                warn!("tls_intercept: {}", reason);
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::ConnectIntercept,
+                    &audit::EventContext {
+                        route_id: service,
+                        auth_mechanism: route.and_then(|r| r.managed_auth_mechanism.clone()),
+                        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                        managed_credential_active: Some(false),
+                        injection_mode: route.and_then(|r| r.managed_injection_mode.clone()),
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::ManagedCredentialUnavailable,
+                        ),
+                    },
+                    ctx.host,
+                    ctx.port,
+                    &reason,
+                );
+                reverse::send_error_generic(tls_stream, 503, "Service Unavailable").await?;
+                return Ok(());
+            }
+        }
+    } else if let Some(cred) = cred {
         reverse::inject_credential_for_mode(cred, &mut request);
     }
+
     let auth_header_lower = cred.map(|c| c.header_name.to_lowercase());
     for (name, value) in &filtered_headers {
         if let (Some(cred), Some(hdr)) = (cred, auth_header_lower.as_ref())
+            && aws_route.is_none()
             && matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
             && name.to_lowercase() == *hdr
         {
@@ -409,21 +504,35 @@ where
         mode: audit::ProxyMode::ConnectIntercept,
         event_ctx: audit::EventContext {
             route_id: service,
-            auth_mechanism: cred.map(|c| match c.proxy_inject_mode {
-                InjectMode::Header | InjectMode::BasicAuth => {
-                    nono::undo::NetworkAuditAuthMechanism::PhantomHeader
-                }
-                InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
-                InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
-            }),
-            auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
-            managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
-            injection_mode: cred.map(|c| match c.inject_mode {
-                InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
-                InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
-                InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
-                InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
-            }),
+            auth_mechanism: if aws_route.is_some() {
+                Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader)
+            } else {
+                cred.map(|c| match c.proxy_inject_mode {
+                    InjectMode::Header | InjectMode::BasicAuth => {
+                        nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                    }
+                    InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
+                    InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+                })
+            },
+            auth_outcome: if aws_route.is_some() || cred.is_some() {
+                Some(nono::undo::NetworkAuditAuthOutcome::Succeeded)
+            } else {
+                None
+            },
+            managed_credential_active: Some(
+                cred.is_some() || oauth2_route.is_some() || aws_route.is_some(),
+            ),
+            injection_mode: if aws_route.is_some() {
+                Some(nono::undo::NetworkAuditInjectionMode::Header)
+            } else {
+                cred.map(|c| match c.inject_mode {
+                    InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+                    InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+                    InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+                    InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                })
+            },
             denial_category: None,
         },
         target: ctx.host,
@@ -445,21 +554,37 @@ where
             audit::ProxyMode::ConnectIntercept,
             &audit::EventContext {
                 route_id: service,
-                auth_mechanism: cred.map(|c| match c.proxy_inject_mode {
-                    InjectMode::Header | InjectMode::BasicAuth => {
-                        nono::undo::NetworkAuditAuthMechanism::PhantomHeader
-                    }
-                    InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
-                    InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
-                }),
-                auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
-                managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
-                injection_mode: cred.map(|c| match c.inject_mode {
-                    InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
-                    InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
-                    InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
-                    InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
-                }),
+                auth_mechanism: if aws_route.is_some() {
+                    Some(nono::undo::NetworkAuditAuthMechanism::PhantomHeader)
+                } else {
+                    cred.map(|c| match c.proxy_inject_mode {
+                        InjectMode::Header | InjectMode::BasicAuth => {
+                            nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                        }
+                        InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
+                        InjectMode::QueryParam => {
+                            nono::undo::NetworkAuditAuthMechanism::PhantomQuery
+                        }
+                    })
+                },
+                auth_outcome: if aws_route.is_some() || cred.is_some() {
+                    Some(nono::undo::NetworkAuditAuthOutcome::Succeeded)
+                } else {
+                    None
+                },
+                managed_credential_active: Some(
+                    cred.is_some() || oauth2_route.is_some() || aws_route.is_some(),
+                ),
+                injection_mode: if aws_route.is_some() {
+                    Some(nono::undo::NetworkAuditInjectionMode::Header)
+                } else {
+                    cred.map(|c| match c.inject_mode {
+                        InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
+                        InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
+                        InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
+                        InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                    })
+                },
                 denial_category: Some(
                     nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
                 ),
