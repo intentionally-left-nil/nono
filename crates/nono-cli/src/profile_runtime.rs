@@ -161,6 +161,85 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
     Ok(())
 }
 
+/// Verify the provenance of session hooks that carry a `source_pack` tag.
+///
+/// For each hook (before/after) whose `source_pack` is `Some(pack_key)`:
+/// 1. Look up `pack_key` in the lockfile — missing entry is a hard error.
+/// 2. Derive `pack_dir = package_install_dir(ns, name)`.
+/// 3. Strip the hook's script path of `pack_dir` as a prefix to get the
+///    relative artifact key.  If stripping fails (path is not under
+///    `pack_dir`, or a `..` traversal was injected), that is a hard error.
+/// 4. Check that the stripped key is present in `LockedPackage.artifacts`.
+///    An undeclared file cannot receive the SHA guarantee from
+///    `verify_profile_packs()`.
+///
+/// SHA-256 re-hashing is intentionally omitted here: `verify_profile_packs()`
+/// has already verified every lockfile-declared artifact before this
+/// function is called.
+fn verify_session_hook_provenance(
+    profile: &profile::Profile,
+    lockfile: &package::Lockfile,
+) -> crate::Result<()> {
+    for hook_opt in [&profile.session_hooks.before, &profile.session_hooks.after] {
+        let Some(hook) = hook_opt.as_ref() else {
+            continue;
+        };
+        let Some(pack_key) = hook.source_pack.as_deref() else {
+            continue;
+        };
+
+        let locked_pkg = lockfile.packages.get(pack_key).ok_or_else(|| {
+            nono::NonoError::PackageInstall(format!(
+                "session hook references pack '{}' which has no lockfile entry; \
+                     reinstall with: nono pull {} --force",
+                pack_key, pack_key
+            ))
+        })?;
+
+        let parts: Vec<&str> = pack_key.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            return Err(nono::NonoError::PackageInstall(format!(
+                "invalid source_pack key '{}' in session hook",
+                pack_key
+            )));
+        }
+        let (ns, name) = (parts[0], parts[1]);
+        let pack_dir = package::package_install_dir(ns, name)?;
+
+        // Derive artifact key: strip pack_dir prefix, convert to forward-slash string.
+        let relative = hook.script.strip_prefix(&pack_dir).map_err(|_| {
+            nono::NonoError::PackageInstall(format!(
+                "session hook script '{}' is not under pack dir '{}' for pack '{}'; \
+                 reinstall with: nono pull {} --force",
+                hook.script.display(),
+                pack_dir.display(),
+                pack_key,
+                pack_key
+            ))
+        })?;
+
+        // Safety: after strip_prefix the remainder has no leading '/' and
+        // no '..' components that would escape pack_dir.
+        let artifact_key = relative
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if !locked_pkg.artifacts.contains_key(&artifact_key) {
+            return Err(nono::NonoError::PackageInstall(format!(
+                "session hook script '{}' is not a declared artifact of pack '{}'; \
+                 reinstall with: nono pull {} --force",
+                hook.script.display(),
+                pack_key,
+                pack_key
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn canonical_signer(uri: &str) -> &str {
     uri.rsplit_once('@').map_or(uri, |(prefix, _)| prefix)
 }
@@ -469,6 +548,15 @@ fn prepare_profile_with_options(
 
         verify_profile_packs(&packs_to_verify)?;
 
+        // After SHA verification of pack artifacts, confirm that any
+        // session hook tagged with source_pack is a declared artifact of
+        // that pack.  SHA was already validated above; this is a pure
+        // membership check.
+        if !packs_to_verify.is_empty() {
+            let lockfile = package::read_lockfile()?;
+            verify_session_hook_provenance(&profile, &lockfile)?;
+        }
+
         if !packs_to_verify.is_empty() && !options.hook_output_silent {
             eprintln!("  Verified {} pack(s)", packs_to_verify.len());
         }
@@ -629,8 +717,204 @@ pub(crate) fn prepare_profile_for_preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package::{ArtifactType, LockedArtifact, LockedPackage, Lockfile};
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
+
+    // ============================================================================
+    // Helpers shared by tests in this module
+    // ============================================================================
+
+    /// Set up an isolated HOME/XDG_CONFIG_HOME for tests that call functions
+    /// which resolve the nono config directory (e.g. package_install_dir).
+    /// Returns the lock guard, env-var guard, and the tempdir; all three must
+    /// stay in scope for the duration of the test.
+    fn isolated_home() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::test_env::EnvVarGuard,
+        tempfile::TempDir,
+    ) {
+        let lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let home = tempdir().expect("tempdir");
+        let home_str = home.path().to_str().expect("tempdir path utf-8");
+        let env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home_str),
+            ("XDG_CONFIG_HOME", home_str),
+        ]);
+        (lock, env, home)
+    }
+
+    /// Build a minimal default Profile (no packs, no hooks).
+    fn empty_profile() -> profile::Profile {
+        profile::Profile {
+            meta: profile::ProfileMeta {
+                name: "test".to_string(),
+                version: "1.0".to_string(),
+                description: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Build a Lockfile containing a single LockedPackage for `pack_key` with
+    /// `artifact_keys` as its artifact entries (all typed as `Plugin` — the
+    /// type doesn't matter for the provenance check).
+    fn make_lockfile(pack_key: &str, artifact_keys: &[&str]) -> Lockfile {
+        let mut artifacts = BTreeMap::new();
+        for key in artifact_keys {
+            artifacts.insert(
+                key.to_string(),
+                LockedArtifact {
+                    sha256: "deadbeef".to_string(),
+                    artifact_type: ArtifactType::Plugin,
+                },
+            );
+        }
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            pack_key.to_string(),
+            LockedPackage {
+                artifacts,
+                ..Default::default()
+            },
+        );
+        Lockfile {
+            lockfile_version: 4,
+            registry: "https://registry.nono.sh".to_string(),
+            packages,
+        }
+    }
+
+    // ============================================================================
+    // verify_session_hook_provenance tests
+    // ============================================================================
+
+    #[test]
+    fn verify_session_hook_provenance_accepts_declared_artifact() {
+        let (_lock, _env, _home) = isolated_home();
+
+        let pack_key = "acme/testpack";
+        let artifact_key = "hooks/setup.sh";
+        let pack_dir =
+            package::package_install_dir("acme", "testpack").expect("package_install_dir");
+        let lockfile = make_lockfile(pack_key, &[artifact_key]);
+
+        let mut p = empty_profile();
+        p.session_hooks.before = Some(profile::SessionHook {
+            script: pack_dir.join(artifact_key),
+            timeout_secs: None,
+            source_pack: Some(pack_key.to_string()),
+        });
+
+        verify_session_hook_provenance(&p, &lockfile)
+            .expect("declared artifact should pass provenance check");
+    }
+
+    #[test]
+    fn verify_session_hook_provenance_rejects_undeclared_artifact() {
+        let (_lock, _env, _home) = isolated_home();
+
+        let pack_key = "acme/testpack";
+        let pack_dir =
+            package::package_install_dir("acme", "testpack").expect("package_install_dir");
+        // Lockfile declares only "hooks/setup.sh"; hook references "hooks/other.sh".
+        let lockfile = make_lockfile(pack_key, &["hooks/setup.sh"]);
+
+        let mut p = empty_profile();
+        p.session_hooks.before = Some(profile::SessionHook {
+            script: pack_dir.join("hooks/other.sh"),
+            timeout_secs: None,
+            source_pack: Some(pack_key.to_string()),
+        });
+
+        let err = verify_session_hook_provenance(&p, &lockfile)
+            .expect_err("undeclared artifact must be rejected");
+        assert!(
+            err.to_string().contains("not a declared artifact"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_session_hook_provenance_rejects_missing_lockfile_entry() {
+        let (_lock, _env, _home) = isolated_home();
+
+        let pack_dir =
+            package::package_install_dir("acme", "testpack").expect("package_install_dir");
+        // Lockfile does not contain the pack at all.
+        let lockfile = make_lockfile("other/pack", &["hooks/setup.sh"]);
+
+        let mut p = empty_profile();
+        p.session_hooks.before = Some(profile::SessionHook {
+            script: pack_dir.join("hooks/setup.sh"),
+            timeout_secs: None,
+            source_pack: Some("acme/testpack".to_string()),
+        });
+
+        let err = verify_session_hook_provenance(&p, &lockfile)
+            .expect_err("missing lockfile entry must be rejected");
+        assert!(
+            err.to_string().contains("no lockfile entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_session_hook_provenance_skips_hooks_without_source_pack() {
+        let (_lock, _env, _home) = isolated_home();
+
+        // An empty lockfile — the function must not touch hooks with source_pack = None.
+        let lockfile = Lockfile {
+            lockfile_version: 4,
+            registry: String::new(),
+            packages: BTreeMap::new(),
+        };
+
+        let mut p = empty_profile();
+        p.session_hooks.before = Some(profile::SessionHook {
+            script: std::path::PathBuf::from("/usr/local/bin/before.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+
+        verify_session_hook_provenance(&p, &lockfile)
+            .expect("hook without source_pack should be skipped");
+    }
+
+    #[test]
+    fn verify_session_hook_provenance_checks_after_hook() {
+        let (_lock, _env, _home) = isolated_home();
+
+        let pack_key = "acme/testpack";
+        let pack_dir =
+            package::package_install_dir("acme", "testpack").expect("package_install_dir");
+        let lockfile = make_lockfile(pack_key, &["hooks/cleanup.sh"]);
+
+        let mut p = empty_profile();
+        // before hook is fine (no source_pack), after hook is tagged but undeclared.
+        p.session_hooks.before = Some(profile::SessionHook {
+            script: std::path::PathBuf::from("/usr/local/bin/before.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+        p.session_hooks.after = Some(profile::SessionHook {
+            script: pack_dir.join("hooks/other.sh"),
+            timeout_secs: None,
+            source_pack: Some(pack_key.to_string()),
+        });
+
+        let err = verify_session_hook_provenance(&p, &lockfile)
+            .expect_err("undeclared after-hook must be rejected");
+        assert!(
+            err.to_string().contains("not a declared artifact"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn prepare_profile_for_preflight_matches_runtime_resolution() {

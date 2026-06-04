@@ -1198,6 +1198,13 @@ pub struct SessionHook {
     /// If absent, no timeout is enforced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+
+    /// Internal-only: the pack key ("namespace/name") that owns this hook,
+    /// set at load time when the script path was resolved from a `$PACK_DIR/`
+    /// prefix in a pack-store profile. Never serialized to or from disk.
+    /// `deny_unknown_fields` ensures a caller cannot forge this via JSON.
+    #[serde(skip)]
+    pub(crate) source_pack: Option<String>,
 }
 
 /// Session lifecycle hooks for a profile.
@@ -1896,6 +1903,77 @@ fn missing_base_prompt_enabled() -> bool {
     PROMPT_ON_MISSING_BASE.with(std::cell::Cell::get)
 }
 
+/// Resolve `$PACK_DIR/` prefixes in `session_hooks.before` and
+/// `session_hooks.after` for a profile loaded from the pack store.
+///
+/// For each hook whose script string starts with `"$PACK_DIR/"`:
+/// - Strips the prefix, joins the remainder onto `pack_dir`, stores the
+///   resulting absolute `PathBuf` in `hook.script`, and tags
+///   `hook.source_pack = Some(pack_key.to_string())`.
+///
+/// If the script string contains `$PACK_DIR` anywhere other than as the
+/// sole leading prefix (e.g., bare `$PACK_DIR`, or `prefix/$PACK_DIR/...`),
+/// the function returns an error.
+///
+/// Scripts that are already absolute paths with no `$PACK_DIR` are left
+/// untouched — they fall through to `validate_hook_script` at execution time.
+///
+/// Scripts that are relative paths with no `$PACK_DIR` are also left
+/// untouched; existing validation will reject them at execution time.
+fn apply_pack_dir_to_session_hooks(
+    profile: &mut Profile,
+    pack_key: &str,
+    pack_dir: &Path,
+) -> Result<()> {
+    for hook_opt in [
+        &mut profile.session_hooks.before,
+        &mut profile.session_hooks.after,
+    ] {
+        if let Some(hook) = hook_opt.as_mut() {
+            let s = hook.script.to_str().ok_or_else(|| {
+                NonoError::ProfileParse(
+                    "session hook script path contains non-UTF-8 characters".to_string(),
+                )
+            })?;
+
+            if let Some(relative) = s.strip_prefix("$PACK_DIR/") {
+                hook.script = pack_dir.join(relative);
+                hook.source_pack = Some(pack_key.to_string());
+            } else if s.contains("$PACK_DIR") {
+                return Err(NonoError::ProfileParse(
+                    "$PACK_DIR must appear only as a leading prefix in session hook \
+                     script paths"
+                        .to_string(),
+                ));
+            }
+            // Absolute path or relative path with no $PACK_DIR: untouched.
+        }
+    }
+    Ok(())
+}
+
+/// Reject any `$PACK_DIR` occurrences in `session_hooks` for user-authored profiles.
+///
+/// Called on every profile that is NOT loaded from the pack store. If either
+/// hook's script string contains `$PACK_DIR` at any position, this returns an
+/// error — the variable is only meaningful in pack-store profiles where the
+/// containing pack directory is known.
+fn reject_pack_dir_in_session_hooks(profile: &Profile, source: &Path) -> Result<()> {
+    for hook_opt in [&profile.session_hooks.before, &profile.session_hooks.after] {
+        if let Some(hook) = hook_opt.as_ref() {
+            let s = hook.script.to_str().unwrap_or("");
+            if s.contains("$PACK_DIR") {
+                return Err(NonoError::ProfileParse(format!(
+                    "$PACK_DIR is only valid in pack-store profiles; \
+                     profile {} is user-authored",
+                    source.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Steps 1–3 of profile resolution (user dir → pack store → built-in).
 /// Returns `Ok(Some(profile))` on a hit, `Ok(None)` if all sources miss,
 /// and `Err(_)` on validation/IO failures. Shared between `load_profile`
@@ -1906,7 +1984,9 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
         return load_registry_profile(name_or_path).map(Some);
     }
     if is_file_path_ref(name_or_path) {
-        return load_profile_from_path(Path::new(name_or_path)).map(Some);
+        let profile = load_profile_from_path(Path::new(name_or_path))?;
+        reject_pack_dir_in_session_hooks(&profile, Path::new(name_or_path))?;
+        return Ok(Some(profile));
     }
     if !is_valid_profile_name(name_or_path) {
         return Err(NonoError::ProfileParse(format!(
@@ -1917,7 +1997,9 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
     let profile_path = resolve_user_profile_path(name_or_path)?;
     if profile_path.exists() {
         tracing::info!("Loading user profile from: {}", profile_path.display());
-        return finalize_profile(load_from_file(&profile_path)?).map(Some);
+        let profile = finalize_profile(load_from_file(&profile_path)?)?;
+        reject_pack_dir_in_session_hooks(&profile, &profile_path)?;
+        return Ok(Some(profile));
     }
     if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
         tracing::info!(
@@ -1928,8 +2010,13 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
         // Inject the source pack ref so it's always present in the
         // verification list, even if the profile JSON doesn't declare it.
         if !profile.packs.contains(&pack_key) {
-            profile.packs.push(pack_key);
+            profile.packs.push(pack_key.clone());
         }
+        let pack_dir = crate::package::package_install_dir(
+            pack_key.split_once('/').map_or("", |(ns, _)| ns),
+            pack_key.split_once('/').map_or("", |(_, n)| n),
+        )?;
+        apply_pack_dir_to_session_hooks(&mut profile, &pack_key, &pack_dir)?;
         // If we just resolved through `always-further/claude`, also offer
         // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
         // where users `nono pull always-further/claude` directly,
@@ -2157,7 +2244,16 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
                 .join(format!("{install_name}.json"));
             if profile_path.exists() {
                 tracing::info!("Loading registry profile from: {}", profile_path.display());
-                return finalize_profile(load_from_file(&profile_path)?);
+                let mut profile = finalize_profile(load_from_file(&profile_path)?)?;
+                // Q1 fix: inject the pack key into profile.packs so it always
+                // reaches verify_profile_packs, matching the other two pack-store
+                // loaders (load_profile_inner and load_base_profile_raw).
+                let pack_key = package_ref.key();
+                if !profile.packs.contains(&pack_key) {
+                    profile.packs.push(pack_key.clone());
+                }
+                apply_pack_dir_to_session_hooks(&mut profile, &pack_key, &install_dir)?;
+                return Ok(profile);
             }
         }
     }
@@ -2427,17 +2523,18 @@ fn load_base_profile_raw(
                 name,
                 sibling_path.display()
             );
-            return Ok(ResolvedBase::Sibling(
-                parse_profile_file(&sibling_path)?,
-                sibling_path,
-            ));
+            let profile = parse_profile_file(&sibling_path)?;
+            reject_pack_dir_in_session_hooks(&profile, &sibling_path)?;
+            return Ok(ResolvedBase::Sibling(profile, sibling_path));
         }
     }
 
     // 1. User profiles take precedence.
     let profile_path = resolve_user_profile_path(name)?;
     if profile_path.exists() {
-        return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
+        let profile = parse_profile_file(&profile_path)?;
+        reject_pack_dir_in_session_hooks(&profile, &profile_path)?;
+        return Ok(ResolvedBase::Global(profile));
     }
 
     // 2. Pack-store: any installed pack with a matching `install_as`.
@@ -2447,8 +2544,13 @@ fn load_base_profile_raw(
     if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
         let mut base = parse_profile_file(&profile_path)?;
         if !base.packs.contains(&pack_key) {
-            base.packs.push(pack_key);
+            base.packs.push(pack_key.clone());
         }
+        let pack_dir = crate::package::package_install_dir(
+            pack_key.split_once('/').map_or("", |(ns, _)| ns),
+            pack_key.split_once('/').map_or("", |(_, n)| n),
+        )?;
+        apply_pack_dir_to_session_hooks(&mut base, &pack_key, &pack_dir)?;
         return Ok(ResolvedBase::Global(base));
     }
 
@@ -2475,8 +2577,13 @@ fn load_base_profile_raw(
                 if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
                     let mut base = parse_profile_file(&profile_path)?;
                     if !base.packs.contains(&pack_key) {
-                        base.packs.push(pack_key);
+                        base.packs.push(pack_key.clone());
                     }
+                    let pack_dir = crate::package::package_install_dir(
+                        pack_key.split_once('/').map_or("", |(ns, _)| ns),
+                        pack_key.split_once('/').map_or("", |(_, n)| n),
+                    )?;
+                    apply_pack_dir_to_session_hooks(&mut base, &pack_key, &pack_dir)?;
                     return Ok(ResolvedBase::Global(base));
                 }
             }
@@ -4882,10 +4989,12 @@ mod tests {
             before: Some(SessionHook {
                 script: PathBuf::from("/base/before.sh"),
                 timeout_secs: Some(5),
+                source_pack: None,
             }),
             after: Some(SessionHook {
                 script: PathBuf::from("/base/after.sh"),
                 timeout_secs: None,
+                source_pack: None,
             }),
         };
         let mut child = child_profile();
@@ -4893,6 +5002,7 @@ mod tests {
             before: Some(SessionHook {
                 script: PathBuf::from("/child/before.sh"),
                 timeout_secs: None,
+                source_pack: None,
             }),
             after: None,
         };
@@ -4915,6 +5025,7 @@ mod tests {
             before: Some(SessionHook {
                 script: PathBuf::from("/base/before.sh"),
                 timeout_secs: Some(7),
+                source_pack: None,
             }),
             after: None,
         };
@@ -4923,6 +5034,253 @@ mod tests {
         assert_eq!(before.script, PathBuf::from("/base/before.sh"));
         assert_eq!(before.timeout_secs, Some(7));
         assert!(merged.session_hooks.after.is_none());
+    }
+
+    // ============================================================================
+    // apply_pack_dir_to_session_hooks + reject_pack_dir_in_session_hooks
+    // ============================================================================
+
+    #[test]
+    fn test_apply_pack_dir_strips_prefix_and_tags_source_pack() {
+        let pack_dir = PathBuf::from("/home/user/.config/nono/packages/acme/mypack");
+        let mut profile = base_profile();
+        profile.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("$PACK_DIR/hooks/before.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+        profile.session_hooks.after = Some(SessionHook {
+            script: PathBuf::from("$PACK_DIR/hooks/after.sh"),
+            timeout_secs: Some(30),
+            source_pack: None,
+        });
+
+        apply_pack_dir_to_session_hooks(&mut profile, "acme/mypack", &pack_dir)
+            .expect("apply should succeed");
+
+        let before = profile.session_hooks.before.as_ref().unwrap();
+        assert_eq!(
+            before.script,
+            PathBuf::from("/home/user/.config/nono/packages/acme/mypack/hooks/before.sh")
+        );
+        assert_eq!(before.source_pack, Some("acme/mypack".to_string()));
+
+        let after = profile.session_hooks.after.as_ref().unwrap();
+        assert_eq!(
+            after.script,
+            PathBuf::from("/home/user/.config/nono/packages/acme/mypack/hooks/after.sh")
+        );
+        assert_eq!(after.source_pack, Some("acme/mypack".to_string()));
+        assert_eq!(after.timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_apply_pack_dir_rejects_non_leading_pack_dir() {
+        let pack_dir = PathBuf::from("/home/user/.config/nono/packages/acme/mypack");
+        let mut profile = base_profile();
+
+        // bare $PACK_DIR
+        profile.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("$PACK_DIR"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+        let err =
+            apply_pack_dir_to_session_hooks(&mut profile, "acme/mypack", &pack_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("leading prefix"),
+            "unexpected error: {err}"
+        );
+
+        // $PACK_DIR embedded after a prefix
+        profile.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/some/prefix/$PACK_DIR/foo.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+        let err =
+            apply_pack_dir_to_session_hooks(&mut profile, "acme/mypack", &pack_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("leading prefix"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_apply_pack_dir_leaves_plain_absolute_paths_untouched() {
+        let pack_dir = PathBuf::from("/home/user/.config/nono/packages/acme/mypack");
+        let mut profile = base_profile();
+        profile.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/usr/local/bin/setup.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+
+        apply_pack_dir_to_session_hooks(&mut profile, "acme/mypack", &pack_dir)
+            .expect("apply should succeed for plain absolute path");
+
+        let before = profile.session_hooks.before.as_ref().unwrap();
+        assert_eq!(before.script, PathBuf::from("/usr/local/bin/setup.sh"));
+        assert_eq!(before.source_pack, None);
+    }
+
+    #[test]
+    fn test_reject_pack_dir_errors_on_dollar_pack_dir() {
+        let profile_source = PathBuf::from("/home/user/.config/nono/profiles/mypkg.json");
+        let mut profile = base_profile();
+        profile.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("$PACK_DIR/hooks/before.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+
+        let err = reject_pack_dir_in_session_hooks(&profile, &profile_source).unwrap_err();
+        assert!(
+            err.to_string().contains("user-authored"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_pack_dir_passes_clean_profile() {
+        let profile_source = PathBuf::from("/home/user/.config/nono/profiles/mypkg.json");
+        let mut profile = base_profile();
+        profile.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/usr/local/bin/before.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+        profile.session_hooks.after = Some(SessionHook {
+            script: PathBuf::from("/usr/local/bin/after.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+
+        reject_pack_dir_in_session_hooks(&profile, &profile_source)
+            .expect("clean profile should pass reject check");
+    }
+
+    #[test]
+    fn test_reject_pack_dir_checks_after_hook_too() {
+        let profile_source = PathBuf::from("/home/user/.config/nono/profiles/mypkg.json");
+        let mut profile = base_profile();
+        profile.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/usr/local/bin/before.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+        profile.session_hooks.after = Some(SessionHook {
+            script: PathBuf::from("$PACK_DIR/hooks/after.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+
+        let err = reject_pack_dir_in_session_hooks(&profile, &profile_source).unwrap_err();
+        assert!(
+            err.to_string().contains("user-authored"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ============================================================================
+    // merge_profiles source_pack propagation
+    // ============================================================================
+
+    #[test]
+    fn test_merge_propagates_source_pack_from_child() {
+        // Child overrides base hook; child's source_pack tag must survive.
+        let mut base = base_profile();
+        base.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/base/before.sh"),
+            timeout_secs: None,
+            source_pack: Some("base/pack".to_string()),
+        });
+
+        let mut child = child_profile();
+        child.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/child/before.sh"),
+            timeout_secs: None,
+            source_pack: Some("child/pack".to_string()),
+        });
+
+        let merged = merge_profiles(base, child);
+        let hook = merged.session_hooks.before.expect("before present");
+        assert_eq!(hook.script, PathBuf::from("/child/before.sh"));
+        assert_eq!(hook.source_pack, Some("child/pack".to_string()));
+    }
+
+    #[test]
+    fn test_merge_inherits_source_pack_from_base() {
+        // Child has no before hook; base before hook (with source_pack) propagates.
+        let mut base = base_profile();
+        base.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/base/before.sh"),
+            timeout_secs: Some(10),
+            source_pack: Some("base/pack".to_string()),
+        });
+
+        let merged = merge_profiles(base, child_profile());
+        let hook = merged
+            .session_hooks
+            .before
+            .expect("before inherited from base");
+        assert_eq!(hook.script, PathBuf::from("/base/before.sh"));
+        assert_eq!(hook.source_pack, Some("base/pack".to_string()));
+        assert_eq!(hook.timeout_secs, Some(10));
+    }
+
+    #[test]
+    fn test_merge_cross_pack_extends_preserves_base_pack_identity() {
+        // Simulates: a/derived extends b/base.
+        // b/base defines a hook with source_pack = "b/base" and its resolved path.
+        // After merge, the hook keeps b/base's identity.
+        let pack_b_dir = PathBuf::from("/home/u/.config/nono/packages/b/base");
+
+        let mut base = base_profile(); // represents b/base's profile
+        base.session_hooks.before = Some(SessionHook {
+            script: pack_b_dir.join("hooks/setup.sh"),
+            timeout_secs: None,
+            source_pack: Some("b/base".to_string()),
+        });
+
+        let derived = child_profile(); // represents a/derived's profile (no hooks of its own)
+
+        let merged = merge_profiles(base, derived);
+        let hook = merged
+            .session_hooks
+            .before
+            .expect("hook inherited from b/base");
+        assert_eq!(hook.script, pack_b_dir.join("hooks/setup.sh"));
+        assert_eq!(
+            hook.source_pack,
+            Some("b/base".to_string()),
+            "source_pack must point to the containing pack (b/base), not the derived pack"
+        );
+    }
+
+    #[test]
+    fn test_merge_source_pack_none_not_overridden_by_base_tag() {
+        // Child explicitly provides a hook with source_pack = None (absolute path).
+        // Base has the same hook with source_pack = Some("base/pack").
+        // Child wins; source_pack must remain None.
+        let mut base = base_profile();
+        base.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/base/before.sh"),
+            timeout_secs: None,
+            source_pack: Some("base/pack".to_string()),
+        });
+
+        let mut child = child_profile();
+        child.session_hooks.before = Some(SessionHook {
+            script: PathBuf::from("/child/before.sh"),
+            timeout_secs: None,
+            source_pack: None,
+        });
+
+        let merged = merge_profiles(base, child);
+        let hook = merged.session_hooks.before.expect("before present");
+        assert_eq!(hook.script, PathBuf::from("/child/before.sh"));
+        assert_eq!(hook.source_pack, None);
     }
 
     #[test]
