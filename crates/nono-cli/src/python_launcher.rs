@@ -10,8 +10,7 @@
 //!     │
 //!     ├─ NONO_CAP_FILE set? (ADR-4)
 //!     │
-//!     ├─ YES → inner(): unset _CONDA_PYTHON_ARGV0, print stub, exit
-//!     │        (production: call Py_BytesMain)
+//!     ├─ YES → inner(): unset _CONDA_PYTHON_ARGV0, call Py_BytesMain
 //!     │
 //!     └─ NO  → outer():
 //!              validate $PREFIX from current_exe()
@@ -50,8 +49,22 @@ use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_run
 #[cfg(unix)]
 use crate::{DETACHED_SESSION_ID_ENV, hook_runtime, session};
 use nono::{NonoError, Result};
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+// ── libpython C-ABI entry point (ADR-11) ─────────────────────────────────────
+//
+// Py_BytesMain is the correct embedding entry point for bytes argv (i.e. the
+// same raw bytes the OS provides), as opposed to Py_Main which takes wchar_t.
+// The symbol is resolved at load time via DT_NEEDED (ELF) / LC_LOAD_DYLIB
+// (Mach-O) linkage arranged by build.rs when --features python-launcher is
+// active.  The build script validates that libpython is present at link time;
+// conda-build's DSO check then validates it again at packaging time.
+unsafe extern "C" {
+    fn Py_BytesMain(argc: std::os::raw::c_int, argv: *mut *mut std::os::raw::c_char)
+        -> std::os::raw::c_int;
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -384,18 +397,41 @@ fn inner() -> ! {
         }
     }
 
-    // PROTOTYPE STUB ─────────────────────────────────────────────────────────
-    // Production builds (python-sandbox feedstock) replace this block with a
-    // direct call to Py_BytesMain via DT_NEEDED linkage against libpython.
-    // The argv Vec<String> built above should be marshalled to Vec<CString>
-    // and passed as argc/argv.
-    eprintln!("[python_launcher] inner branch reached (prototype stub)");
-    eprintln!("[python_launcher] argv that would be passed to Py_BytesMain:");
-    for (i, a) in argv.iter().enumerate() {
-        eprintln!("  argv[{i}] = {a:?}");
-    }
-    std::process::exit(0);
-    // END PROTOTYPE STUB ─────────────────────────────────────────────────────
+    // Marshal Vec<String> → Vec<CString> → Vec<*mut c_char> for Py_BytesMain.
+    //
+    // argv[0] has already been restored to the original value the user typed
+    // (e.g. a venv symlink path) by the block above, so CPython's getpath.py
+    // can find pyvenv.cfg and venv detection works correctly (ADR-5).
+    //
+    // Any argv element that contains an interior NUL is replaced with an empty
+    // string rather than panicking; CPython would have truncated at the NUL
+    // anyway, and this keeps inner() -> ! infallible.
+    let cstrings: Vec<CString> = argv
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap_or_default())
+        .collect();
+    let mut c_argv: Vec<*mut std::os::raw::c_char> = cstrings
+        .iter()
+        .map(|cs| cs.as_ptr() as *mut std::os::raw::c_char)
+        .collect();
+
+    // SAFETY:
+    // - We are the only thread at this point: the sandbox has just been applied
+    //   via execve into a fresh process image; no other threads exist.
+    // - c_argv has the same lifetime as cstrings; both outlive the Py_BytesMain
+    //   call because they are stack-allocated in this frame and Py_BytesMain
+    //   does not return (it calls exit() internally after running Python).
+    // - argc is exactly c_argv.len(), which matches cstrings.len().
+    let exit_code = unsafe {
+        Py_BytesMain(
+            c_argv.len() as std::os::raw::c_int,
+            c_argv.as_mut_ptr(),
+        )
+    };
+
+    // Py_BytesMain normally does not return (it calls Py_Exit / exit()
+    // internally).  If it does return, honour the exit code it provides.
+    std::process::exit(exit_code);
 }
 
 // ── Prefix derivation and validation (ADR-8) ─────────────────────────────────
