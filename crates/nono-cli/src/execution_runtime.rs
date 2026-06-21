@@ -40,7 +40,7 @@ fn apply_pre_fork_sandbox(
     Ok(())
 }
 
-fn cleanup_capability_state_file(cap_file_path: &std::path::Path) {
+pub(crate) fn cleanup_capability_state_file(cap_file_path: &std::path::Path) {
     if cap_file_path.exists() {
         let _ = std::fs::remove_file(cap_file_path);
     }
@@ -470,7 +470,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 }
 
-fn write_capability_state_file(
+pub(crate) fn write_capability_state_file(
     caps: &CapabilitySet,
     bypass_protection_paths: &[std::path::PathBuf],
     allowed_domains: &[String],

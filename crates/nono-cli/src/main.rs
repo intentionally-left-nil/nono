@@ -79,16 +79,24 @@ mod update_check;
 mod why_runtime;
 mod wiring;
 
+#[cfg(feature = "python-launcher")]
+mod python_launcher;
+
 #[cfg(test)]
 mod test_env;
 
+#[cfg(not(feature = "python-launcher"))]
 use app_runtime::run as run_cli;
+#[cfg(not(feature = "python-launcher"))]
 use clap::Parser;
+#[cfg(not(feature = "python-launcher"))]
 use cli::Cli;
+#[cfg(not(feature = "python-launcher"))]
 use cli_bootstrap::{
     collect_legacy_network_warnings, init_theme, init_tracing, normalize_legacy_flag_env_vars,
     print_legacy_network_warnings,
 };
+#[cfg(not(feature = "python-launcher"))]
 use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
 };
@@ -101,6 +109,7 @@ const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 pub(crate) use launch_runtime::rollback_base_exclusions;
 pub(crate) use proxy_runtime::merge_dedup_ports;
 
+#[cfg(not(feature = "python-launcher"))]
 fn main() {
     let legacy_network_warnings = collect_legacy_network_warnings();
     normalize_legacy_flag_env_vars();
@@ -133,6 +142,11 @@ fn main() {
         eprintln!("nono: {}", e);
         std::process::exit(1);
     }
+}
+
+#[cfg(feature = "python-launcher")]
+fn main() {
+    python_launcher::run()
 }
 
 #[cfg(test)]
