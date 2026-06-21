@@ -3020,6 +3020,7 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 /// - $XDG_RUNTIME_DIR: XDG runtime directory (no default; left unexpanded when unset)
 /// - $TMPDIR: System temporary directory
 /// - $UID: Current user ID
+/// - $PREFIX: Conda environment prefix (only when set via [`set_launcher_prefix`])
 ///
 /// If $HOME cannot be determined and the path uses $HOME or XDG variables,
 /// the unexpanded variable is left in place (which will cause the path to not exist).
@@ -3108,7 +3109,29 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
         expanded = expanded.replace("$NONO_PACKAGES", &packages_dir.to_string_lossy());
     }
 
+    // $PREFIX: conda environment root — only substituted when the python launcher
+    // has called set_launcher_prefix() with a validated prefix value.  For the
+    // upstream nono binary this OnceLock is never set, so $PREFIX is left
+    // literally in the output exactly as today (no behaviour change for nono).
+    if let Some(prefix) = LAUNCHER_PREFIX.get() {
+        expanded = expanded.replace("$PREFIX", prefix);
+    }
+
     Ok(PathBuf::from(expanded))
+}
+
+/// Global conda environment prefix injected by the python launcher before any
+/// profile expansion.  Set exactly once per process; never settable from
+/// environment variables (the launcher derives the value from `current_exe()`).
+static LAUNCHER_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Register the conda environment prefix for [`expand_vars`] substitution.
+///
+/// Must be called before the first profile load.  Subsequent calls are
+/// silently ignored (the [`OnceLock`] guarantees the value is set at most
+/// once, so a sandboxed child re-exec cannot override it).
+pub fn set_launcher_prefix(prefix: String) {
+    let _ = LAUNCHER_PREFIX.set(prefix);
 }
 
 /// List available profiles (built-in + user)
