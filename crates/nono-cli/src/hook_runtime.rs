@@ -159,8 +159,12 @@ pub(crate) fn execute_after_hook(
 /// Build a `Command` configured for a hook execution.
 ///
 /// Sets `NONO_SESSION_ID` / `NONO_WORKDIR` / `NONO_HOOK_TYPE` plus the
-/// kind-specific env vars and stdio. Installs the `setpgid` pre-exec hook so
-/// the child can be killed as a process group on timeout.
+/// kind-specific env vars and stdio. When running inside the python launcher,
+/// also sets `PREFIX` to the conda environment prefix so hook scripts can use
+/// it (e.g. to create `$PREFIX/tmp`), matching the `$PREFIX` token used in
+/// profile path fields.
+/// Installs the `setpgid` pre-exec hook so the child can be killed as a
+/// process group on timeout.
 fn build_hook_command(
     script: &Path,
     session_id: &str,
@@ -171,6 +175,17 @@ fn build_hook_command(
     cmd.env("NONO_SESSION_ID", session_id);
     cmd.env("NONO_WORKDIR", workdir);
     cmd.env("NONO_HOOK_TYPE", kind.type_env());
+
+    // Inject the conda environment prefix when running under the python
+    // launcher (set_launcher_prefix was called during outer() initialisation).
+    // Hook scripts can use $PREFIX to create per-environment directories
+    // (e.g. $PREFIX/tmp) before the sandbox starts.  The name matches the
+    // $PREFIX token used in profile path fields so pack authors use one
+    // consistent name in both the profile JSON and hook scripts.
+    if let Some(prefix) = profile::get_launcher_prefix() {
+        cmd.env("PREFIX", prefix);
+    }
+
     cmd.stdin(Stdio::null());
     cmd.stderr(Stdio::piped());
 

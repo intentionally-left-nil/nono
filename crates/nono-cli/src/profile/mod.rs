@@ -3134,6 +3134,12 @@ pub fn set_launcher_prefix(prefix: String) {
     let _ = LAUNCHER_PREFIX.set(prefix);
 }
 
+/// Return the conda environment prefix previously registered via
+/// [`set_launcher_prefix`], or `None` if running outside the python launcher.
+pub fn get_launcher_prefix() -> Option<&'static str> {
+    LAUNCHER_PREFIX.get().map(|s| s.as_str())
+}
+
 /// List available profiles (built-in + user)
 pub fn list_profiles() -> Vec<String> {
     let mut profiles = builtin::list_builtin();
