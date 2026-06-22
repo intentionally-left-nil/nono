@@ -35,21 +35,25 @@
 //! - The inner branch unconditionally unsets `_CONDA_PYTHON_ARGV0` so user
 //!   Python code never observes it.
 
-use crate::cli::SandboxArgs;
+use crate::cli::{PullArgs, SandboxArgs};
 use crate::exec_strategy::{ExecConfig, is_dangerous_env_var};
 use crate::execution_runtime::{cleanup_capability_state_file, write_capability_state_file};
 use crate::launch_runtime::{
     ExecutionFlags, ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions,
     TrustLaunchOptions, select_threading_context,
 };
-use crate::profile;
 use crate::proxy_runtime::{prepare_proxy_launch_options, start_proxy_runtime};
 use crate::sandbox_prepare::{prepare_sandbox, validate_external_proxy_bypass};
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
 #[cfg(unix)]
 use crate::{DETACHED_SESSION_ID_ENV, hook_runtime, session};
+use crate::{package_cmd, profile};
+use nix::libc;
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, fork};
 use nono::{NonoError, Result};
 use std::ffi::CString;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -62,8 +66,10 @@ use tracing::{info, warn};
 // active.  The build script validates that libpython is present at link time;
 // conda-build's DSO check then validates it again at packaging time.
 unsafe extern "C" {
-    fn Py_BytesMain(argc: std::os::raw::c_int, argv: *mut *mut std::os::raw::c_char)
-        -> std::os::raw::c_int;
+    fn Py_BytesMain(
+        argc: std::os::raw::c_int,
+        argv: *mut *mut std::os::raw::c_char,
+    ) -> std::os::raw::c_int;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -131,7 +137,17 @@ fn outer() -> Result<()> {
     // 3. Resolve profile name.
     let profile_name = profile_resolution::resolve_profile_name(&prefix)?;
 
-    // 4. Build a minimal SandboxArgs that tells prepare_sandbox which profile
+    // 4. Pull the registry pack to ensure we have the latest version.
+    //    The pull opens an HTTPS connection (ureq → rustls → aws-lc-rs) which
+    //    leaves a long-lived crypto thread pool alive for the rest of the
+    //    process.  Running it in a forked subprocess means the threads die with
+    //    the child before we reach the supervised fork, preserving the
+    //    single-threaded invariant required by execute_supervised() (ADR-12).
+    if profile::is_registry_ref(&profile_name) {
+        refresh_pack_in_subprocess(&profile_name);
+    }
+
+    // 5. Build a minimal SandboxArgs that tells prepare_sandbox which profile
     //    to load.  allow_cwd is set to true so the launcher automatically
     //    grants access to the working directory without requiring a profile
     //    update or an interactive prompt (equivalent to --allow-cwd on the
@@ -143,7 +159,7 @@ fn outer() -> Result<()> {
         ..SandboxArgs::default()
     };
 
-    // 5. Run the standard sandbox preparation pipeline: loads the profile,
+    // 6. Run the standard sandbox preparation pipeline: loads the profile,
     //    builds CapabilitySet, resolves network/credential/env policy.
     let mut prepared = prepare_sandbox(&args, /*silent=*/ true)?;
 
@@ -156,7 +172,7 @@ fn outer() -> Result<()> {
     // 6. Prepare proxy launch options from the prepared sandbox.
     let proxy = prepare_proxy_launch_options(&args, &prepared, /*silent=*/ true)?;
 
-    // 7. Start proxy (no-op if the profile has no network policy).
+    // 8. Start proxy (no-op if the profile has no network policy).
     let active_proxy = start_proxy_runtime(&proxy, &mut prepared.caps)?;
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
@@ -379,6 +395,90 @@ fn outer() -> Result<()> {
     std::process::exit(exit_code);
 }
 
+// ── Pack refresh (ADR-12) ─────────────────────────────────────────────────────
+
+/// Run `package_cmd::run_pull` in a short-lived forked child so the TLS thread
+/// pool spawned by aws-lc-rs during the HTTPS handshake dies with the child and
+/// never pollutes the parent's thread count.
+///
+/// The parent is single-threaded at this point (called early in `outer()`,
+/// before any nono machinery has run), so forking is safe: there are no other
+/// threads that could be holding heap-allocator locks in the parent's address
+/// space.
+///
+/// The child calls `libc::_exit` — not `std::process::exit` — to skip Rust's
+/// `atexit` handlers and stdio buffer flushes.  Flushing stdio in the child
+/// after it has written its own output could re-emit data into the parent's
+/// terminal stream.
+///
+/// Failure semantics match the previous inline call: if the child exits
+/// non-zero (the child already printed the warning), or if `fork()` itself
+/// fails, we log a warning and continue with whatever is cached.  We never
+/// fail-closed here because the cached pack is by construction the same one
+/// that worked on the previous run.
+fn refresh_pack_in_subprocess(profile_name: &str) {
+    // Flush stderr before fork so any buffered bytes are emitted exactly once.
+    let _ = std::io::stderr().flush();
+
+    // SAFETY: the parent is single-threaded at this call site.  No other
+    // threads exist, so there are no allocator locks to deadlock on in the
+    // child.  The child runs to completion and calls _exit, so there is no
+    // inter-process shared state to corrupt.
+    let fork_result = unsafe { fork() };
+
+    match fork_result {
+        Ok(ForkResult::Child) => {
+            let exit_code = match package_cmd::run_pull(PullArgs {
+                package_ref: profile_name.to_string(),
+                registry: None,
+                force: false,
+                init: false,
+                help: None,
+            }) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!(
+                        "python-launcher: warning: could not update pack '{}': {e} \
+                         (continuing with cached version)",
+                        profile_name
+                    );
+                    1
+                }
+            };
+            // _exit: skip atexit handlers and stdio flushes.
+            // SAFETY: single-threaded child, no shared state with parent.
+            unsafe { libc::_exit(exit_code) };
+        }
+        Ok(ForkResult::Parent { child }) => {
+            match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, 0)) | Ok(WaitStatus::Exited(_, _)) => {
+                    // Non-zero: child already printed the warning; nothing more to do.
+                }
+                Ok(_) => {
+                    // Signalled or other status — treat as warning, continue.
+                    eprintln!(
+                        "python-launcher: warning: pack refresh subprocess ended \
+                         unexpectedly (continuing with cached version)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "python-launcher: warning: pack refresh waitpid error: {e} \
+                         (continuing with cached version)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "python-launcher: warning: could not fork to refresh pack '{}': {e} \
+                 (continuing with cached version)",
+                profile_name
+            );
+        }
+    }
+}
+
 // ── Inner (sandboxed re-exec'd child) ────────────────────────────────────────
 
 fn inner() -> ! {
@@ -422,12 +522,8 @@ fn inner() -> ! {
     //   call because they are stack-allocated in this frame and Py_BytesMain
     //   does not return (it calls exit() internally after running Python).
     // - argc is exactly c_argv.len(), which matches cstrings.len().
-    let exit_code = unsafe {
-        Py_BytesMain(
-            c_argv.len() as std::os::raw::c_int,
-            c_argv.as_mut_ptr(),
-        )
-    };
+    let exit_code =
+        unsafe { Py_BytesMain(c_argv.len() as std::os::raw::c_int, c_argv.as_mut_ptr()) };
 
     // Py_BytesMain normally does not return (it calls Py_Exit / exit()
     // internally).  If it does return, honour the exit code it provides.
